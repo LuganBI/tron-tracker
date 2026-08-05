@@ -1888,13 +1888,20 @@ func getEthereumDailyStats(day string) ethStatistics {
 }
 
 func (s *Server) topDelegate(c *gin.Context) {
-	date, ok := getDateParam(c, "date", yesterday())
+	date, ok := getTopDelegateDateParam(c)
 	if !ok {
 		return
 	}
 
 	n, ok := getIntParam(c, "n", 20)
 	if !ok {
+		return
+	}
+	if n < 0 || n > database.DelegateTopPerType {
+		c.JSON(200, gin.H{
+			"code":  400,
+			"error": fmt.Sprintf("n must be between 0 and %d", database.DelegateTopPerType),
+		})
 		return
 	}
 
@@ -1997,6 +2004,16 @@ func (s *Server) topDelegate(c *gin.Context) {
 	}
 
 	c.JSON(200, results)
+}
+
+func getTopDelegateDateParam(c *gin.Context) (time.Time, bool) {
+	dateParam := "date"
+	if _, hasDate := c.GetQuery(dateParam); !hasDate {
+		if _, hasStartDate := c.GetQuery("start_date"); hasStartDate {
+			dateParam = "start_date"
+		}
+	}
+	return getDateParam(c, dateParam, yesterday())
 }
 
 func (s *Server) txAnalyze(c *gin.Context) {

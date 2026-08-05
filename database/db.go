@@ -156,9 +156,10 @@ func New(cfg *config.DBConfig) *RawDB {
 		panic(dbErr)
 	}
 
-	// Narrow read model for resource ranking endpoints. Historical rows are
-	// populated explicitly by cmd/resource-backfill; the completion table keeps
-	// reads on the wide daily tables until each date is safely backfilled.
+	// Compact read model for resource ranking endpoints. Finalized days are
+	// populated automatically by flushDailyStats; cmd/resource-backfill handles
+	// historical ranges. The completion table keeps reads on canonical daily
+	// tables until each date is safely projected.
 	dbErr = db.AutoMigrate(&models.ResourceTransaction{}, &models.ResourceTransactionDay{})
 	if dbErr != nil {
 		panic(dbErr)
@@ -628,9 +629,17 @@ func (db *RawDB) GetNetIncByDateDays(date time.Time, days int) int {
 
 var resourceStakeTypes = []int{12, 112, 54, 154, 55, 155, 59, 159}
 
-func isResourceTransactionType(txType uint8) bool {
+var resourceDelegateTypes = []int{57, 157, 58, 158}
+
+// DelegateTopPerType is the maximum supported /top_delegate result size. A
+// global top-N across bandwidth and energy can only contain rows that are in
+// the top N of their own type, so retaining this many per date/type is exact for
+// every API request whose n is <= this value.
+const DelegateTopPerType = 1000
+
+func isStakeTransactionType(txType uint8) bool {
 	switch txType {
-	case 12, 112, 54, 154, 55, 155, 57, 157, 58, 158, 59, 159:
+	case 12, 112, 54, 154, 55, 155, 59, 159:
 		return true
 	default:
 		return false
@@ -674,15 +683,19 @@ func (db *RawDB) GetTopDelegateRelatedTxsByDateAndN(date time.Time, n int, isUnD
 	}
 
 	// Once a day is backfilled, rank from the compact numeric read model. Its
-	// (tx_date, type, amount DESC) index turns both branches into ten-row index
-	// scans and avoids indexing/sorting the multi-million-row wide daily table.
-	if db.isResourceTransactionDayComplete(queryDate) {
+	// (tx_date, type, amount DESC) index turns both branches into bounded index
+	// scans and avoids sorting the multi-million-row canonical daily table. Keep
+	// the per-type ORDER BY to the indexed columns; the outer sort only handles
+	// at most 2*n rows and supplies deterministic tie-breakers.
+	if n <= DelegateTopPerType && db.isResourceTransactionDayComplete(queryDate) {
 		sql := "(SELECT height, tx_index AS `index`, type, owner_addr, to_addr, CAST(amount AS CHAR) AS amount " +
-			"FROM resource_transactions WHERE tx_date = ? AND type = ? ORDER BY resource_transactions.amount DESC LIMIT ?) " +
+			"FROM resource_transactions WHERE tx_date = ? AND type = ? " +
+			"ORDER BY resource_transactions.amount DESC LIMIT ?) " +
 			"UNION ALL " +
 			"(SELECT height, tx_index AS `index`, type, owner_addr, to_addr, CAST(amount AS CHAR) AS amount " +
-			"FROM resource_transactions WHERE tx_date = ? AND type = ? ORDER BY resource_transactions.amount DESC LIMIT ?) " +
-			"ORDER BY CAST(amount AS UNSIGNED) DESC LIMIT ?"
+			"FROM resource_transactions WHERE tx_date = ? AND type = ? " +
+			"ORDER BY resource_transactions.amount DESC LIMIT ?) " +
+			"ORDER BY CAST(amount AS UNSIGNED) DESC, height ASC, `index` ASC LIMIT ?"
 		var txs []*models.Transaction
 		db.db.Raw(sql, queryDate, bwType, n, queryDate, energyType, n, n).Scan(&txs)
 		return txs
@@ -698,7 +711,7 @@ func (db *RawDB) GetTopDelegateRelatedTxsByDateAndN(date time.Time, n int, isUnD
 		"(SELECT * FROM `%s` WHERE type = %d ORDER BY "+txAmountExpr+" DESC LIMIT %d) "+
 			"UNION ALL "+
 			"(SELECT * FROM `%s` WHERE type = %d ORDER BY "+txAmountExpr+" DESC LIMIT %d) "+
-			"ORDER BY "+txAmountExpr+" DESC LIMIT %d",
+			"ORDER BY "+txAmountExpr+" DESC, height ASC, `index` ASC LIMIT %d",
 		table, bwType, n, table, energyType, n, n)
 
 	var txs []*models.Transaction
@@ -1805,7 +1818,7 @@ func (db *RawDB) SaveTransactions(transactions []*models.Transaction) error {
 
 	resourceTxs := make([]*models.ResourceTransaction, 0)
 	for _, tx := range transactions {
-		if !isResourceTransactionType(tx.Type) {
+		if !isStakeTransactionType(tx.Type) {
 			continue
 		}
 		amount, err := strconv.ParseUint(tx.Amount.String(), 10, 64)
@@ -1824,9 +1837,9 @@ func (db *RawDB) SaveTransactions(transactions []*models.Transaction) error {
 		})
 	}
 
-	// Keep the canonical and narrow copies atomic. The completion marker is only
-	// written when a day is finalized/backfilled, so current-day reads still use
-	// the canonical table if this process was deployed partway through the day.
+	// Keep the canonical row and the stake subset atomic. Delegate rows are
+	// ranked from the finalized canonical day and only its top slice is copied;
+	// current-day /top_delegate reads continue to use the canonical table.
 	return db.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Table(dbName).Create(transactions).Error; err != nil {
 			return err
@@ -1838,10 +1851,10 @@ func (db *RawDB) SaveTransactions(transactions []*models.Transaction) error {
 	})
 }
 
-// BackfillResourceTransactions copies a finalized date range from the canonical
-// daily transaction tables into the narrow resource read model. It is
-// idempotent and deliberately refuses the active/future tracking day, which may
-// still be receiving blocks.
+// BackfillResourceTransactions projects a finalized date range from the
+// canonical daily transaction tables into the compact resource read model. It
+// is idempotent and deliberately refuses the active/future tracking day, which
+// may still be receiving blocks.
 func (db *RawDB) BackfillResourceTransactions(start time.Time, days int) error {
 	if days < 1 {
 		return fmt.Errorf("days must be positive")
@@ -1866,19 +1879,42 @@ func (db *RawDB) backfillResourceTransactionsForDate(date string) error {
 	hasSource := db.db.Migrator().HasTable(table)
 
 	return db.db.Transaction(func(tx *gorm.DB) error {
+		// Rebuild, rather than append, so rerunning this command also compacts dates
+		// produced by the original all-resource implementation.
+		if err := tx.Where("tx_date = ?", date).Delete(&models.ResourceTransaction{}).Error; err != nil {
+			return fmt.Errorf("clear resource transactions for %s: %w", date, err)
+		}
+
+		var copied int64
 		if hasSource {
-			// The type predicate uses the existing daily-table type index. Only the
-			// small resource subset is copied, and the destination's composite PK
-			// makes retries safe.
-			sql := "INSERT IGNORE INTO resource_transactions " +
+			// Stake/unstake volume is small and /top_stake aggregates every matching
+			// row, so retain that subset in full.
+			stakeSQL := "INSERT IGNORE INTO resource_transactions " +
 				"(tx_date, height, tx_index, type, owner_addr, to_addr, amount) " +
 				"SELECT ?, height, `index`, type, owner_addr, to_addr, " + txAmountExpr + " " +
-				"FROM `" + table + "` WHERE type IN (12,112,54,154,55,155,57,157,58,158,59,159)"
-			result := tx.Exec(sql, date)
+				"FROM `" + table + "` WHERE type IN (12,112,54,154,55,155,59,159)"
+			result := tx.Exec(stakeSQL, date)
 			if result.Error != nil {
-				return fmt.Errorf("backfill resource transactions for %s: %w", date, result.Error)
+				return fmt.Errorf("backfill stake transactions for %s: %w", date, result.Error)
 			}
-			db.logger.Infof("Backfilled [%d] resource transactions for [%s]", result.RowsAffected, date)
+			copied += result.RowsAffected
+
+			// /top_delegate merges two types and asks for at most
+			// DelegateTopPerType rows. Keeping that many per individual type is
+			// therefore exact while avoiding millions of redundant daily rows.
+			delegateSQL := "INSERT IGNORE INTO resource_transactions " +
+				"(tx_date, height, tx_index, type, owner_addr, to_addr, amount) " +
+				"SELECT ?, height, `index`, type, owner_addr, to_addr, " + txAmountExpr + " " +
+				"FROM `" + table + "` WHERE type = ? " +
+				"ORDER BY " + txAmountExpr + " DESC LIMIT ?"
+			for _, txType := range resourceDelegateTypes {
+				result = tx.Exec(delegateSQL, date, txType, DelegateTopPerType)
+				if result.Error != nil {
+					return fmt.Errorf("backfill delegate type %d for %s: %w", txType, date, result.Error)
+				}
+				copied += result.RowsAffected
+			}
+			db.logger.Infof("Backfilled [%d] compact resource transactions for [%s]", copied, date)
 		}
 
 		// A finalized missing source table is a legitimate empty/gap day. Mark it

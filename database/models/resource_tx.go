@@ -1,9 +1,9 @@
 package models
 
-// ResourceTransaction is the narrow read model used by /top_delegate and
-// /top_stake. The canonical, wide transaction row remains in the daily
-// transactions_YYMMDD table; this table only duplicates the fields required by
-// the resource ranking endpoints.
+// ResourceTransaction is the compact read model used by /top_delegate and
+// /top_stake. It stores every stake/unstake row, but only the daily top delegate
+// rows for each of types 57/157/58/158. The canonical, wide transaction row
+// remains in transactions_YYMMDD.
 //
 // Amount is numeric here (unlike Transaction.Amount, which must also hold token
 // values wider than uint64 and legacy "<nil>" values). Resource contract amounts
@@ -19,9 +19,9 @@ type ResourceTransaction struct {
 	Amount    uint64 `gorm:"type:bigint unsigned;not null;index:idx_resource_date_type_amount,priority:3,sort:desc"`
 }
 
-// ResourceTransactionDay records that a daily wide transaction table has been
-// fully copied into ResourceTransaction. Its presence makes switching reads to
-// the narrow table safe; absent dates continue to use the legacy daily table.
+// ResourceTransactionDay records that a finalized daily transaction table has
+// been projected into ResourceTransaction. Its presence makes switching reads
+// to the compact table safe; absent dates continue to use the canonical table.
 type ResourceTransactionDay struct {
 	TxDate string `gorm:"column:tx_date;size:6;primaryKey"`
 }
