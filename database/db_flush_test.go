@@ -31,7 +31,13 @@ func newFlushTestDB(t *testing.T) *RawDB {
 	if err != nil {
 		t.Fatalf("open test db: %v", err)
 	}
-	if err := gdb.AutoMigrate(&models.FeeStatistic{}, &models.ExchangeStatistic{}, &models.Charger{}); err != nil {
+	if err := gdb.AutoMigrate(
+		&models.FeeStatistic{},
+		&models.ExchangeStatistic{},
+		&models.Charger{},
+		&models.ResourceTransaction{},
+		&models.ResourceTransactionDay{},
+	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 

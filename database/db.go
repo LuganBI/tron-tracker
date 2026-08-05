@@ -156,6 +156,14 @@ func New(cfg *config.DBConfig) *RawDB {
 		panic(dbErr)
 	}
 
+	// Narrow read model for resource ranking endpoints. Historical rows are
+	// populated explicitly by cmd/resource-backfill; the completion table keeps
+	// reads on the wide daily tables until each date is safely backfilled.
+	dbErr = db.AutoMigrate(&models.ResourceTransaction{}, &models.ResourceTransactionDay{})
+	if dbErr != nil {
+		panic(dbErr)
+	}
+
 	var trackingDateMeta models.Meta
 	db.Where(models.Meta{Key: models.TrackingDateKey}).Attrs(models.Meta{Val: cfg.StartDate}).FirstOrCreate(&trackingDateMeta)
 
@@ -618,16 +626,66 @@ func (db *RawDB) GetNetIncByDateDays(date time.Time, days int) int {
 	return generated - burned
 }
 
+var resourceStakeTypes = []int{12, 112, 54, 154, 55, 155, 59, 159}
+
+func isResourceTransactionType(txType uint8) bool {
+	switch txType {
+	case 12, 112, 54, 154, 55, 155, 57, 157, 58, 158, 59, 159:
+		return true
+	default:
+		return false
+	}
+}
+
+func (db *RawDB) isResourceTransactionDayComplete(date string) bool {
+	var count int64
+	err := db.db.Model(&models.ResourceTransactionDay{}).
+		Where("tx_date = ?", date).
+		Count(&count).Error
+	return err == nil && count > 0
+}
+
+func (db *RawDB) completedResourceTransactionDays(dates []string) map[string]bool {
+	completed := make(map[string]bool)
+	if len(dates) == 0 {
+		return completed
+	}
+	var rows []models.ResourceTransactionDay
+	if err := db.db.Where("tx_date IN ?", dates).Find(&rows).Error; err != nil {
+		return completed
+	}
+	for _, row := range rows {
+		completed[row.TxDate] = true
+	}
+	return completed
+}
+
 func (db *RawDB) GetTopDelegateRelatedTxsByDateAndN(date time.Time, n int, isUnDelegate bool) []*models.Transaction {
 	if n < 0 {
 		n = 0
 	}
 
 	table := "transactions_" + date.Format("060102")
+	queryDate := date.Format("060102")
 
 	bwType, energyType := 57, 157
 	if isUnDelegate {
 		bwType, energyType = 58, 158
+	}
+
+	// Once a day is backfilled, rank from the compact numeric read model. Its
+	// (tx_date, type, amount DESC) index turns both branches into ten-row index
+	// scans and avoids indexing/sorting the multi-million-row wide daily table.
+	if db.isResourceTransactionDayComplete(queryDate) {
+		sql := "(SELECT height, tx_index AS `index`, type, owner_addr, to_addr, CAST(amount AS CHAR) AS amount " +
+			"FROM resource_transactions WHERE tx_date = ? AND type = ? ORDER BY resource_transactions.amount DESC LIMIT ?) " +
+			"UNION ALL " +
+			"(SELECT height, tx_index AS `index`, type, owner_addr, to_addr, CAST(amount AS CHAR) AS amount " +
+			"FROM resource_transactions WHERE tx_date = ? AND type = ? ORDER BY resource_transactions.amount DESC LIMIT ?) " +
+			"ORDER BY CAST(amount AS UNSIGNED) DESC LIMIT ?"
+		var txs []*models.Transaction
+		db.db.Raw(sql, queryDate, bwType, n, queryDate, energyType, n, n).Scan(&txs)
+		return txs
 	}
 
 	// Rank each resource type separately so MySQL serves each "ORDER BY amount
@@ -670,34 +728,64 @@ func (db *RawDB) GetStakeRelatedTxsByDateDays(date time.Time, days int) []*model
 		return nil
 	}
 
-	// Each day is an index range-scan plus a clustered-index lookup per matched
-	// row. Cold, those lookups are random disk I/O (~seconds for a day's worth),
-	// and doing the days one after another makes the latency add up. Run them
-	// concurrently so the I/O overlaps and wall-clock is ~one cold day, not their
-	// sum. Each goroutine writes only its own slot, so no locking is needed.
+	dates := make([]string, days)
+	for i := range dates {
+		dates[i] = date.AddDate(0, 0, i).Format("060102")
+	}
+	covered := db.completedResourceTransactionDays(dates)
+
+	// Fetch all covered dates in one pass from the narrow table. Only the three
+	// fields consumed by buildTopStake cross the DB boundary.
+	var results []*models.Transaction
+	coveredDates := make([]string, 0, len(covered))
+	for _, d := range dates {
+		if covered[d] {
+			coveredDates = append(coveredDates, d)
+		}
+	}
+	if len(coveredDates) > 0 {
+		var narrow []*models.Transaction
+		err := db.db.Model(&models.ResourceTransaction{}).
+			Select("owner_addr, type, CAST(amount AS CHAR) AS amount").
+			Where("tx_date IN ? AND type IN ?", coveredDates, resourceStakeTypes).
+			Scan(&narrow).Error
+		if err == nil {
+			results = append(results, narrow...)
+		} else {
+			// A damaged/missing read model must degrade to the canonical data, not
+			// silently return an incomplete ranking.
+			covered = make(map[string]bool)
+		}
+	}
+
+	// Dates not yet backfilled retain the old behavior. Run those daily queries
+	// concurrently, but project only the columns used by the endpoint instead of
+	// loading every field from the wide transaction row.
 	const concurrency = 16
 	perDay := make([][]*models.Transaction, days)
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
 	for i := 0; i < days; i++ {
+		if covered[dates[i]] {
+			continue
+		}
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			queryDate := date.AddDate(0, 0, i).Format("060102")
 			var txs []*models.Transaction
-			db.db.Table("transactions_"+queryDate).
-				Where("type IN ?", []int{12, 112, 54, 154, 55, 155, 59, 159}).
+			db.db.Table("transactions_"+dates[i]).
+				Select("owner_addr, type, amount").
+				Where("type IN ?", resourceStakeTypes).
 				Find(&txs)
 			perDay[i] = txs
 		}(i)
 	}
 	wg.Wait()
 
-	var results []*models.Transaction
 	for _, txs := range perDay {
 		results = append(results, txs...)
 	}
@@ -1714,7 +1802,95 @@ func (db *RawDB) SaveTransactions(transactions []*models.Transaction) error {
 	if db.createTableIfNotExist(dbName, models.Transaction{}) {
 		db.ensureIndex(dbName, txAmountIndexName, txAmountIndexCols)
 	}
-	return db.db.Table(dbName).Create(transactions).Error
+
+	resourceTxs := make([]*models.ResourceTransaction, 0)
+	for _, tx := range transactions {
+		if !isResourceTransactionType(tx.Type) {
+			continue
+		}
+		amount, err := strconv.ParseUint(tx.Amount.String(), 10, 64)
+		if err != nil {
+			return fmt.Errorf("resource tx %d/%d has invalid amount %q: %w",
+				tx.Height, tx.Index, tx.Amount.String(), err)
+		}
+		resourceTxs = append(resourceTxs, &models.ResourceTransaction{
+			TxDate:    db.trackingDate,
+			Height:    tx.Height,
+			Index:     tx.Index,
+			Type:      tx.Type,
+			OwnerAddr: tx.OwnerAddr,
+			ToAddr:    tx.ToAddr,
+			Amount:    amount,
+		})
+	}
+
+	// Keep the canonical and narrow copies atomic. The completion marker is only
+	// written when a day is finalized/backfilled, so current-day reads still use
+	// the canonical table if this process was deployed partway through the day.
+	return db.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Table(dbName).Create(transactions).Error; err != nil {
+			return err
+		}
+		if len(resourceTxs) == 0 {
+			return nil
+		}
+		return tx.Create(resourceTxs).Error
+	})
+}
+
+// BackfillResourceTransactions copies a finalized date range from the canonical
+// daily transaction tables into the narrow resource read model. It is
+// idempotent and deliberately refuses the active/future tracking day, which may
+// still be receiving blocks.
+func (db *RawDB) BackfillResourceTransactions(start time.Time, days int) error {
+	if days < 1 {
+		return fmt.Errorf("days must be positive")
+	}
+	for i := 0; i < days; i++ {
+		date := start.AddDate(0, 0, i).Format("060102")
+		if db.trackingDate != "" && date >= db.trackingDate {
+			return fmt.Errorf("date %s is not finalized (tracking date %s)", date, db.trackingDate)
+		}
+		if err := db.backfillResourceTransactionsForDate(date); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *RawDB) backfillResourceTransactionsForDate(date string) error {
+	if _, err := time.Parse("060102", date); err != nil {
+		return fmt.Errorf("invalid resource backfill date %q: %w", date, err)
+	}
+	table := "transactions_" + date
+	hasSource := db.db.Migrator().HasTable(table)
+
+	return db.db.Transaction(func(tx *gorm.DB) error {
+		if hasSource {
+			// The type predicate uses the existing daily-table type index. Only the
+			// small resource subset is copied, and the destination's composite PK
+			// makes retries safe.
+			sql := "INSERT IGNORE INTO resource_transactions " +
+				"(tx_date, height, tx_index, type, owner_addr, to_addr, amount) " +
+				"SELECT ?, height, `index`, type, owner_addr, to_addr, " + txAmountExpr + " " +
+				"FROM `" + table + "` WHERE type IN (12,112,54,154,55,155,57,157,58,158,59,159)"
+			result := tx.Exec(sql, date)
+			if result.Error != nil {
+				return fmt.Errorf("backfill resource transactions for %s: %w", date, result.Error)
+			}
+			db.logger.Infof("Backfilled [%d] resource transactions for [%s]", result.RowsAffected, date)
+		}
+
+		// A finalized missing source table is a legitimate empty/gap day. Mark it
+		// complete so future range queries do not repeatedly probe a nonexistent
+		// table.
+		if err := tx.Exec(
+			"INSERT IGNORE INTO resource_transaction_days (tx_date) VALUES (?)", date,
+		).Error; err != nil {
+			return fmt.Errorf("mark resource transaction day %s: %w", date, err)
+		}
+		return nil
+	})
 }
 
 func (db *RawDB) SaveMarketPairRule(rule *models.Rule) {
@@ -2767,6 +2943,12 @@ func (db *RawDB) flushDailyStats(date string) error {
 		})
 	if scan.Error != nil {
 		return fmt.Errorf("scan %s: %w", table, scan.Error)
+	}
+	// Finalize the narrow resource read model from the canonical daily table.
+	// This also fills rows from before a mid-day deployment, then records the
+	// completion marker that allows ranking reads to switch safely.
+	if err := db.backfillResourceTransactionsForDate(date); err != nil {
+		return fmt.Errorf("finalize resource transactions %s: %w", date, err)
 	}
 
 	return db.persistDailyStats(cache)
