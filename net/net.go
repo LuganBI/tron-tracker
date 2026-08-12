@@ -102,21 +102,6 @@ func ReportOnChainMonitorMessageToSlack(webhook string, msg SlackMessage) {
 	ReportSlackMessageToWebhook(webhook, msg)
 }
 
-// ReportOnChainMonitorAndWarningMessageToSlack sends the alert to its optional
-// dedicated monitor webhook and always sends a channel-wide notification to
-// warning_webhook. Identical webhook URLs are de-duplicated.
-func ReportOnChainMonitorAndWarningMessageToSlack(webhook string, msg SlackMessage) {
-	warningWebhook := ""
-	if configs != nil {
-		warningWebhook = configs.WarningWebhook
-	}
-
-	if webhook != "" && webhook != warningWebhook {
-		ReportSlackMessageToWebhook(webhook, msg)
-	}
-	ReportSlackMessageToWebhook(warningWebhook, withSlackChannelMention(msg))
-}
-
 func withSlackChannelMention(msg SlackMessage) SlackMessage {
 	msg.Text = strings.TrimSpace(msg.Text + " <!channel>")
 	msg.Blocks = append(append([]SlackBlock(nil), msg.Blocks...), SlackBlock{
@@ -139,6 +124,10 @@ func ReportWarningMessageToSlack(msg SlackMessage) {
 		webhook = configs.WarningWebhook
 	}
 	ReportSlackMessageToWebhook(webhook, msg)
+}
+
+func ReportWarningChannelMessageToSlack(msg SlackMessage) {
+	ReportWarningMessageToSlack(withSlackChannelMention(msg))
 }
 
 func ReportNotificationToSlack(msg string, isWarning bool) {

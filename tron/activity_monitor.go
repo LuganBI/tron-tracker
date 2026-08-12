@@ -1,7 +1,6 @@
 package tron
 
 import (
-	"os"
 	"strings"
 
 	"tron-tracker/config"
@@ -83,7 +82,7 @@ func NewActivityMonitor(cfg *config.OnChainMonitorConfig) *ActivityMonitor {
 
 	return &ActivityMonitor{
 		webhook:         cfg.SlackWebhook,
-		aiopsAppKeys:    parseCommaSeparatedValues(os.Getenv("AIOPS_APP_KEYS")),
+		aiopsAppKeys:    parseCommaSeparatedValues(cfg.AIOpsAppKeys),
 		detectors:       detectors,
 		accumulatorByID: make(map[string]*activityAccumulator),
 	}

@@ -11,8 +11,10 @@ import (
 )
 
 func TestNewActivityMonitorEnablesInternalCombinationWithoutThresholds(t *testing.T) {
-	t.Setenv("AIOPS_APP_KEYS", "app-one, app-two, app-one, ,")
-	monitor := NewActivityMonitor(&config.OnChainMonitorConfig{Enabled: true})
+	monitor := NewActivityMonitor(&config.OnChainMonitorConfig{
+		Enabled:      true,
+		AIOpsAppKeys: "app-one, app-two, app-one, ,",
+	})
 	if monitor == nil {
 		t.Fatal("monitor = nil, want suicide + Stake 2.0 monitoring with zero amount thresholds")
 	}

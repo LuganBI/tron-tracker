@@ -43,7 +43,7 @@ func (m *ActivityMonitor) ReportSuicideWithStake2(
 		return
 	}
 
-	net.ReportOnChainMonitorAndWarningMessageToSlack(m.webhook, formatSuicideStake2Alert(activity))
+	net.ReportWarningChannelMessageToSlack(formatSuicideStake2Alert(activity))
 	if err := net.ReportAIOpsAlert(m.aiopsAppKeys, formatSuicideStake2AIOpsAlert(activity)); err != nil {
 		zap.S().Errorf("report high-risk transaction alert to AIOps failed: %v", err)
 	}

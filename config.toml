@@ -22,8 +22,8 @@
 [onchain_monitor]
   enabled = false
   slack_webhook = "" # empty means fallback to net.warning_webhook
+  aiops_app_keys = "" # comma-separated AIOps app keys
   # When enabled, high-risk on-chain activity is always monitored.
-  # AIOps apps are read from the comma-separated AIOPS_APP_KEYS environment variable.
   stake_threshold_trx = 100000000
   trx_transfer_threshold_trx = 0
   usdt_transfer_threshold_usdt = 0

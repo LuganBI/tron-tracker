@@ -38,6 +38,7 @@ type NetConfig struct {
 type OnChainMonitorConfig struct {
 	Enabled                   bool   `toml:"enabled"`
 	SlackWebhook              string `toml:"slack_webhook"`
+	AIOpsAppKeys              string `toml:"aiops_app_keys"`
 	StakeThresholdTRX         int64  `toml:"stake_threshold_trx"`
 	TRXTransferThresholdTRX   int64  `toml:"trx_transfer_threshold_trx"`
 	USDTTransferThresholdUSDT int64  `toml:"usdt_transfer_threshold_usdt"`
