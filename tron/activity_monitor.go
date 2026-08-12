@@ -2,6 +2,7 @@ package tron
 
 import (
 	"strings"
+	"sync"
 
 	"tron-tracker/config"
 	"tron-tracker/database/models"
@@ -18,6 +19,9 @@ type ActivityMonitor struct {
 	aiopsAppKeys    []string
 	detectors       []ActivityDetector
 	accumulatorByID map[string]*activityAccumulator
+
+	suicideSummaryMu         sync.Mutex
+	suicideSummaryByContract map[string]*suicideContractStatistic
 }
 
 type ActivityDetector interface {
@@ -81,10 +85,11 @@ func NewActivityMonitor(cfg *config.OnChainMonitorConfig) *ActivityMonitor {
 	}
 
 	return &ActivityMonitor{
-		webhook:         cfg.SlackWebhook,
-		aiopsAppKeys:    parseCommaSeparatedValues(cfg.AIOpsAppKeys),
-		detectors:       detectors,
-		accumulatorByID: make(map[string]*activityAccumulator),
+		webhook:                  cfg.SlackWebhook,
+		aiopsAppKeys:             parseCommaSeparatedValues(cfg.AIOpsAppKeys),
+		detectors:                detectors,
+		accumulatorByID:          make(map[string]*activityAccumulator),
+		suicideSummaryByContract: make(map[string]*suicideContractStatistic),
 	}
 }
 

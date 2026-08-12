@@ -95,6 +95,17 @@ func main() {
 			}
 		})
 
+	summaryLocation, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		zap.S().Fatalf("load internal transaction summary timezone: %v", err)
+	}
+	_, err = c.AddFunc("CRON_TZ=Asia/Shanghai 0 0 12 * * *", wrapper(func() error {
+		return tracker.ReportSuicideInternalSummary(time.Now().In(summaryLocation))
+	}))
+	if err != nil {
+		zap.S().Fatalf("schedule internal transaction daily summary: %v", err)
+	}
+
 	_, _ = c.AddFunc("30 1/30 * * * *",
 		wrapper(func() error {
 			return volumeBot.DoTokenListingStatistics()

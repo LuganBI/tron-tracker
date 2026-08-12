@@ -256,6 +256,7 @@ func (t *Tracker) doTrackBlock() {
 				block.BlockHeader.RawData.Number,
 				uint16(idx),
 				txInfoList[idx].ID,
+				calledContractAddress(tx, txToDB.Name),
 			)
 		}
 
@@ -324,6 +325,21 @@ func (t *Tracker) doTrackBlock() {
 		case <-time.After(1 * time.Second):
 		}
 	}
+}
+
+func calledContractAddress(tx types.Transaction, fallback string) string {
+	if len(tx.RawData.Contract) == 0 {
+		return fallback
+	}
+	hexAddress, ok := tx.RawData.Contract[0].Parameter.Value["contract_address"].(string)
+	if !ok || hexAddress == "" {
+		return fallback
+	}
+	address := common.EncodeToBase58(hexAddress)
+	if address == "" {
+		return fallback
+	}
+	return address
 }
 
 func convertTransferData(owner, data string) (*transferData, bool) {

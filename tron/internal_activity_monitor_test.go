@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 
 	"tron-tracker/common"
 	"tron-tracker/config"
@@ -146,7 +147,7 @@ func TestDetectSuicideWithStake2RequiresBothSuccessfulKindsInSameTransaction(t *
 	}
 }
 
-func TestSuicideOnlyInternalMessageIsSimpleAndDoesNotNotifyChannel(t *testing.T) {
+func TestSuicideOnlyInternalTransactionIsNotHighRisk(t *testing.T) {
 	activity, highRisk := detectSuicideWithStake2([]types.InternalTx{
 		{Note: encodeInternalNote("suicide")},
 		{Note: encodeInternalNote("suicide"), Rejected: true},
@@ -157,23 +158,81 @@ func TestSuicideOnlyInternalMessageIsSimpleAndDoesNotNotifyChannel(t *testing.T)
 	if activity.SuicideCount != 1 {
 		t.Fatalf("suicide count = %d, want 1 successful internal", activity.SuicideCount)
 	}
+}
 
-	message := formatSuicideInternalMessage(activity)
+func TestFormatSuicideInternalSummarySortsCalledContracts(t *testing.T) {
+	location := time.FixedZone("CST", 8*60*60)
+	end := time.Date(2026, 8, 12, 12, 0, 0, 0, location)
+	start := end.Add(-24 * time.Hour)
+	message := formatSuicideInternalSummary(start, end, []suicideContractStatistic{
+		{CalledContract: "TSecond", TxCount: 2, SuicideCount: 3},
+		{CalledContract: "TFirst", TxCount: 8, SuicideCount: 10},
+		{CalledContract: "", TxCount: 1, SuicideCount: 1},
+	})
+
 	for _, want := range []string{
-		"TRON internal transaction alert",
-		"Height: `456`",
-		"Index: `8`",
-		"TxHash: `suicide-tx-hash`",
-		"https://tronscan.io/#/transaction/suicide-tx-hash",
+		"TRON internal transaction daily summary",
+		"Period: `2026-08-11 12:00:00` - `2026-08-12 12:00:00` (CST)",
+		"Transactions: `11`",
+		"Internal activities: `14`",
+		"Called contracts: `3`",
+		"1. `TFirst`: `8` tx (72.73%), `10` internal",
+		"2. `TSecond`: `2` tx (18.18%), `3` internal",
+		"3. `unknown`: `1` tx (9.09%), `1` internal",
 	} {
 		if !strings.Contains(message, want) {
-			t.Fatalf("simple internal message missing %q: %s", want, message)
+			t.Fatalf("daily summary missing %q: %s", want, message)
 		}
 	}
-	for _, unwanted := range []string{"<!channel>", "Stake 2.0", "freezeBalanceV2", "delegateResource"} {
+	for _, unwanted := range []string{"<!channel>", "suicide", "Stake 2.0", "freezeBalanceV2", "delegateResource"} {
 		if strings.Contains(message, unwanted) {
-			t.Fatalf("simple internal message contains %q: %s", unwanted, message)
+			t.Fatalf("daily summary contains sensitive detail %q: %s", unwanted, message)
 		}
+	}
+}
+
+func TestSuicideContractStatisticsAccumulateAndResetInMemory(t *testing.T) {
+	monitor := NewActivityMonitor(&config.OnChainMonitorConfig{Enabled: true})
+	monitor.ReportSuicideWithStake2([]types.InternalTx{
+		{Note: encodeInternalNote("suicide")},
+		{Note: encodeInternalNote("suicide"), Rejected: true},
+	}, 1, 0, "tx-1", "TContract")
+	monitor.ReportSuicideWithStake2([]types.InternalTx{
+		{Note: encodeInternalNote("suicide")},
+		{Note: encodeInternalNote("suicide")},
+	}, 2, 0, "tx-2", "TContract")
+
+	stats := monitor.takeSuicideContractStatistics()
+	if len(stats) != 1 {
+		t.Fatalf("statistics count = %d, want 1", len(stats))
+	}
+	if got := stats[0]; got.CalledContract != "TContract" || got.TxCount != 2 || got.SuicideCount != 3 {
+		t.Fatalf("statistics = %#v, want 2 transactions and 3 internals", got)
+	}
+	if got := monitor.takeSuicideContractStatistics(); len(got) != 0 {
+		t.Fatalf("statistics after reset = %#v, want empty", got)
+	}
+}
+
+func TestCalledContractAddressUsesOuterTriggerContract(t *testing.T) {
+	hexAddress := "41" + strings.Repeat("ab", 20)
+	var tx types.Transaction
+	tx.RawData.Contract = append(tx.RawData.Contract, struct {
+		Parameter struct {
+			Value   map[string]interface{} `json:"value"`
+			TypeUrl string                 `json:"type_url"`
+		} `json:"parameter"`
+		Type string `json:"type"`
+	}{})
+	tx.RawData.Contract[0].Parameter.Value = map[string]interface{}{
+		"contract_address": hexAddress,
+	}
+
+	if got, want := calledContractAddress(tx, "fallback"), common.EncodeToBase58(hexAddress); got != want {
+		t.Fatalf("called contract = %q, want %q", got, want)
+	}
+	if got := calledContractAddress(types.Transaction{}, "fallback"); got != "fallback" {
+		t.Fatalf("missing called contract = %q, want fallback", got)
 	}
 }
 
