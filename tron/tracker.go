@@ -251,6 +251,12 @@ func (t *Tracker) doTrackBlock() {
 
 		if !t.isCatching {
 			t.activityMonitor.ReportIfLarge(txToDB, txInfoList[idx].ID)
+			t.activityMonitor.ReportSuicideWithStake2(
+				txInfoList[idx].InternalTxs,
+				block.BlockHeader.RawData.Number,
+				uint16(idx),
+				txInfoList[idx].ID,
+			)
 		}
 
 		for _, log := range txInfoList[idx].Logs {

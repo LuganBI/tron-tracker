@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"tron-tracker/config"
@@ -101,6 +102,30 @@ func ReportOnChainMonitorMessageToSlack(webhook string, msg SlackMessage) {
 	ReportSlackMessageToWebhook(webhook, msg)
 }
 
+// ReportOnChainMonitorAndWarningMessageToSlack sends the alert to its optional
+// dedicated monitor webhook and always sends a channel-wide notification to
+// warning_webhook. Identical webhook URLs are de-duplicated.
+func ReportOnChainMonitorAndWarningMessageToSlack(webhook string, msg SlackMessage) {
+	warningWebhook := ""
+	if configs != nil {
+		warningWebhook = configs.WarningWebhook
+	}
+
+	if webhook != "" && webhook != warningWebhook {
+		ReportSlackMessageToWebhook(webhook, msg)
+	}
+	ReportSlackMessageToWebhook(warningWebhook, withSlackChannelMention(msg))
+}
+
+func withSlackChannelMention(msg SlackMessage) SlackMessage {
+	msg.Text = strings.TrimSpace(msg.Text + " <!channel>")
+	msg.Blocks = append(append([]SlackBlock(nil), msg.Blocks...), SlackBlock{
+		Type: "section",
+		Text: &SlackTextObject{Type: "mrkdwn", Text: "<!channel>"},
+	})
+	return msg
+}
+
 func ReportWarningToSlack(msg string, atMe bool) {
 	if atMe {
 		msg += " <@U01DFGWQ2JK>"
@@ -144,7 +169,12 @@ func GetBlockByHeight(height uint) (*types.Block, error) {
 }
 
 func GetTransactionInfoList(height uint) ([]*types.TransactionInfo, error) {
-	url := configs.FullNode + GetTransactionInfoListPath + strconv.FormatInt(int64(height), 10)
+	// Keep the response in hex form explicitly. TronGrid returns internal
+	// transaction notes as hex for both visibility modes, while visible=true
+	// converts internal caller/recipient addresses to Base58. The tracker expects
+	// the address fields in hex before passing them to EncodeToBase58.
+	url := configs.FullNode + GetTransactionInfoListPath +
+		strconv.FormatInt(int64(height), 10) + "&visible=false"
 	var txInfoList = make([]*types.TransactionInfo, 0)
 	_, err := gridClient.R().SetResult(&txInfoList).Get(url)
 	return txInfoList, err

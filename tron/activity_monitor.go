@@ -1,6 +1,7 @@
 package tron
 
 import (
+	"os"
 	"strings"
 
 	"tron-tracker/config"
@@ -15,6 +16,7 @@ const (
 
 type ActivityMonitor struct {
 	webhook         string
+	aiopsAppKeys    []string
 	detectors       []ActivityDetector
 	accumulatorByID map[string]*activityAccumulator
 }
@@ -79,15 +81,29 @@ func NewActivityMonitor(cfg *config.OnChainMonitorConfig) *ActivityMonitor {
 		detectors = append(detectors, USDTTransferActivityDetector{threshold: threshold})
 	}
 
-	if len(detectors) == 0 {
-		return nil
-	}
-
 	return &ActivityMonitor{
 		webhook:         cfg.SlackWebhook,
+		aiopsAppKeys:    parseCommaSeparatedValues(os.Getenv("AIOPS_APP_KEYS")),
 		detectors:       detectors,
 		accumulatorByID: make(map[string]*activityAccumulator),
 	}
+}
+
+func parseCommaSeparatedValues(value string) []string {
+	values := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, exists := seen[item]; exists {
+			continue
+		}
+		seen[item] = struct{}{}
+		values = append(values, item)
+	}
+	return values
 }
 
 func (m *ActivityMonitor) ReportIfLarge(tx *models.Transaction, txID string) {
