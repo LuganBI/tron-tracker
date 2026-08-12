@@ -130,13 +130,15 @@ func ReportWarningToSlack(msg string, atMe bool) {
 	if atMe {
 		msg += " <@U01DFGWQ2JK>"
 	}
-	resp, err := client.R().SetBody(&SlackMessage{Text: msg}).Post(configs.WarningWebhook)
-	if err != nil {
-		zap.S().Error(err)
-		return
-	}
+	ReportWarningMessageToSlack(SlackMessage{Text: msg})
+}
 
-	zap.S().Infof("Report to slack: %s", resp)
+func ReportWarningMessageToSlack(msg SlackMessage) {
+	webhook := ""
+	if configs != nil {
+		webhook = configs.WarningWebhook
+	}
+	ReportSlackMessageToWebhook(webhook, msg)
 }
 
 func ReportNotificationToSlack(msg string, isWarning bool) {

@@ -144,6 +144,37 @@ func TestDetectSuicideWithStake2RequiresBothSuccessfulKindsInSameTransaction(t *
 	}
 }
 
+func TestSuicideOnlyInternalMessageIsSimpleAndDoesNotNotifyChannel(t *testing.T) {
+	activity, highRisk := detectSuicideWithStake2([]types.InternalTx{
+		{Note: encodeInternalNote("suicide")},
+		{Note: encodeInternalNote("suicide"), Rejected: true},
+	}, 456, 8, "suicide-tx-hash")
+	if highRisk {
+		t.Fatal("highRisk = true, want false for suicide-only transaction")
+	}
+	if activity.SuicideCount != 1 {
+		t.Fatalf("suicide count = %d, want 1 successful internal", activity.SuicideCount)
+	}
+
+	message := formatSuicideInternalMessage(activity)
+	for _, want := range []string{
+		"TRON internal transaction alert",
+		"Height: `456`",
+		"Index: `8`",
+		"TxHash: `suicide-tx-hash`",
+		"https://tronscan.io/#/transaction/suicide-tx-hash",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("simple internal message missing %q: %s", want, message)
+		}
+	}
+	for _, unwanted := range []string{"<!channel>", "Stake 2.0", "freezeBalanceV2", "delegateResource"} {
+		if strings.Contains(message, unwanted) {
+			t.Fatalf("simple internal message contains %q: %s", unwanted, message)
+		}
+	}
+}
+
 func TestIsStake2InternalNote(t *testing.T) {
 	for _, note := range []string{
 		"freezeBalanceV2ForBandwidth",

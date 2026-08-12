@@ -80,3 +80,29 @@ func TestReportOnChainMonitorAndWarningDeduplicatesSameWebhook(t *testing.T) {
 		t.Fatalf("deduplicated warning message does not mention channel: %#v", msg)
 	}
 }
+
+func TestReportWarningMessageToSlackDoesNotAddChannelMention(t *testing.T) {
+	messages := make(chan SlackMessage, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg SlackMessage
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			t.Errorf("decode Slack message: %v", err)
+		}
+		messages <- msg
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	previousConfigs := configs
+	configs = &config.NetConfig{WarningWebhook: server.URL}
+	t.Cleanup(func() { configs = previousConfigs })
+
+	ReportWarningMessageToSlack(SlackMessage{Text: "simple internal transaction alert"})
+	msg := <-messages
+	if msg.Text != "simple internal transaction alert" {
+		t.Fatalf("warning message = %q, want unchanged simple message", msg.Text)
+	}
+	if strings.Contains(msg.Text, "<!channel>") || len(msg.Blocks) != 0 {
+		t.Fatalf("simple warning unexpectedly notifies channel: %#v", msg)
+	}
+}

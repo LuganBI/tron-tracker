@@ -31,8 +31,15 @@ type suicideStake2InternalActivity struct {
 func (m *ActivityMonitor) ReportSuicideWithStake2(
 	internalTxs []types.InternalTx, height uint, index uint16, txID string,
 ) {
+	if m == nil {
+		return
+	}
+
 	activity, ok := detectSuicideWithStake2(internalTxs, height, index, txID)
-	if m == nil || !ok {
+	if activity.SuicideCount > 0 {
+		net.ReportWarningMessageToSlack(net.SlackMessage{Text: formatSuicideInternalMessage(activity)})
+	}
+	if !ok {
 		return
 	}
 
@@ -40,6 +47,16 @@ func (m *ActivityMonitor) ReportSuicideWithStake2(
 	if err := net.ReportAIOpsAlert(m.aiopsAppKeys, formatSuicideStake2AIOpsAlert(activity)); err != nil {
 		zap.S().Errorf("report high-risk transaction alert to AIOps failed: %v", err)
 	}
+}
+
+func formatSuicideInternalMessage(activity suicideStake2InternalActivity) string {
+	return fmt.Sprintf(
+		"TRON internal transaction alert\nHeight: `%d`\nIndex: `%d`\nTxHash: `%s`\n%s",
+		activity.Height,
+		activity.Index,
+		activity.TxID,
+		formatTronTxURL(activity.TxID),
+	)
 }
 
 func detectSuicideWithStake2(
