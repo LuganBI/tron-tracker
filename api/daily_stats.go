@@ -143,3 +143,33 @@ func (s *Server) addrActivityStats(c *gin.Context) {
 		"missing_dates": missing,
 	})
 }
+
+// collectEnergyProviders returns, per day, who delegated ENERGY to each
+// exchange's charger addresses (type 157, provider = owner_addr, fake chargers
+// excluded). Chargers hold no stake, so their collect sweeps run on these
+// just-in-time delegations — the flow-level answer to "whose energy do
+// exchange collects burn".
+func (s *Server) collectEnergyProviders(c *gin.Context) {
+	type dayProviders struct {
+		Date      string                           `json:"date"`
+		Providers []database.CollectEnergyProvider `json:"providers"`
+	}
+	daily := make([]dayProviders, 0)
+	days, missing, ok := s.forEachStatsDay(c, func(date time.Time, day string) error {
+		providers, err := s.db.GetCollectEnergyProvidersByDate(date)
+		if err != nil {
+			return err
+		}
+		daily = append(daily, dayProviders{Date: day, Providers: providers})
+		return nil
+	})
+	if !ok {
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"days":          days,
+		"daily":         daily,
+		"missing_dates": missing,
+	})
+}

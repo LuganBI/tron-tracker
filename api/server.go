@@ -109,6 +109,7 @@ func (s *Server) Start() {
 	s.router.GET("/token_amount_stats", s.tokenAmountStats)
 	s.router.GET("/type_fee_stats", s.typeFeeStats)
 	s.router.GET("/addr_activity_stats", s.addrActivityStats)
+	s.router.GET("/collect_energy_providers", s.collectEnergyProviders)
 
 	s.router.GET("/", s.lastTrackedBlockNumber)
 	s.router.GET("/last-tracked-block-num", s.lastTrackedBlockNumber)

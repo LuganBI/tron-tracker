@@ -129,3 +129,36 @@ func (db *RawDB) GetAddrActivityByDate(date time.Time) (*AddrActivityStat, error
 
 	return stat, nil
 }
+
+// CollectEnergyProvider is one (exchange, provider) row of a day's energy
+// delegation inflow to exchange charger addresses. DelegatedAmount is raw sun
+// as a decimal string (per-provider daily sums exceed comfortable JSON ints).
+type CollectEnergyProvider struct {
+	Exchange        string `json:"exchange"`
+	Provider        string `json:"provider"`
+	TxCount         int64  `json:"tx_count"`
+	DelegatedAmount string `json:"delegated_amount"`
+}
+
+// GetCollectEnergyProvidersByDate aggregates one day's ENERGY resource
+// delegations (type 157, provider in owner_addr) that target known exchange
+// charger addresses (fake chargers excluded), grouped by exchange and
+// provider. This answers "who supplies the energy behind each exchange's
+// collect sweeps": chargers hold no stake of their own, so collect energy
+// arrives almost entirely through these just-in-time delegations.
+func (db *RawDB) GetCollectEnergyProvidersByDate(date time.Time) ([]CollectEnergyProvider, error) {
+	table := "transactions_" + date.Format("060102")
+	var providers []CollectEnergyProvider
+	err := db.db.Raw(fmt.Sprintf(`
+		SELECT c.exchange_name                                               AS exchange,
+		       t.owner_addr                                                  AS provider,
+		       COUNT(*)                                                      AS tx_count,
+		       CAST(COALESCE(SUM(CAST(t.amount AS DECIMAL(38,0))), 0) AS CHAR) AS delegated_amount
+		FROM %s t
+		JOIN chargers c ON t.to_addr = c.address
+		WHERE t.type = 157 AND (c.is_fake = 0 OR c.is_fake IS NULL)
+		GROUP BY c.exchange_name, t.owner_addr
+		ORDER BY exchange, SUM(CAST(t.amount AS DECIMAL(38,0))) DESC`, table)).
+		Scan(&providers).Error
+	return providers, err
+}
