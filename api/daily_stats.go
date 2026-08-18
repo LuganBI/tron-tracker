@@ -11,8 +11,10 @@ import (
 
 // maxDailyStatsDays caps the per-day aggregate endpoints below so one request
 // never fans out over an unbounded number of per-day tables. Each covered day
-// is one (heavy) aggregate query, so the cap also bounds worst-case runtime.
-const maxDailyStatsDays = 31
+// is one heavy aggregate query (up to ~2.5 min measured on production-sized
+// tables), so the cap bounds worst-case runtime to roughly 20 minutes; callers
+// needing longer ranges paginate by start_date.
+const maxDailyStatsDays = 7
 
 // forEachStatsDay iterates the [start_date, start_date+days) window, invoking
 // visit once per day. Days whose backing tables are missing (outside the

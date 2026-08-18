@@ -3,6 +3,8 @@ package database
 import (
 	"fmt"
 	"time"
+
+	"tron-tracker/database/models"
 )
 
 // Aggregated daily statistics pushed down to MySQL. These back the
@@ -26,8 +28,11 @@ type TokenAmountBucket struct {
 // GetTokenAmountBucketsByDate groups one day's transfers of the given token
 // contract by LENGTH(amount), returning per-bucket count, burned fee (sun),
 // stake-covered energy (energy_usage + energy_origin_usage) and raw amount sum.
-// Mirrors the token statistic filters: TriggerSmartContract only (type 31 and
-// its +100 energy variant) with a non-empty sender.
+// Mirrors the per-bucket token statistic filters (statistic.go USDTStats.Add):
+// TriggerSmartContract only (type 31 and its +100 energy variant), non-empty
+// sender, successful result only — failed calls transfer nothing, and
+// excluding them keeps these buckets reconcilable with the existing
+// transfer-distribution statistic.
 func (db *RawDB) GetTokenAmountBucketsByDate(date time.Time, tokenAddr string) ([]TokenAmountBucket, error) {
 	table := "transactions_" + date.Format("060102")
 	var buckets []TokenAmountBucket
@@ -38,7 +43,7 @@ func (db *RawDB) GetTokenAmountBucketsByDate(date time.Time, tokenAddr string) (
 		       COALESCE(SUM(energy_usage + energy_origin_usage), 0)      AS stake_energy,
 		       CAST(COALESCE(SUM(CAST(amount AS DECIMAL(38,0))), 0) AS CHAR) AS amount
 		FROM %s
-		WHERE name = ? AND type IN (31, 131) AND from_addr <> ''
+		WHERE name = ? AND type IN (31, 131) AND from_addr <> '' AND result = 1
 		GROUP BY LENGTH(amount)
 		ORDER BY digit_len`, table), tokenAddr).Scan(&buckets).Error
 	return buckets, err
@@ -53,17 +58,22 @@ type TypeFeeStat struct {
 	Fee     int64 `json:"fee"`
 }
 
-// GetTypeFeeStatsByDate groups one day's full transaction table by type,
-// returning per-type count and burned fee (sun). The per-type fee sum equals
-// the day's total_statistics fee by construction (same source rows).
+// GetTypeFeeStatsByDate groups one day's transaction table by type, returning
+// per-type count and burned fee (sun). Synthesized transfer rows (type 255,
+// models.TransferType) are excluded — their fee duplicates the originating
+// transaction's, and 255%100 would masquerade as type 55; this mirrors the
+// `type <> 255` scan in flushDailyStats, so the per-type fee sum stays
+// reconcilable with total_statistics. Failed transactions are deliberately
+// kept: their fee is genuinely burned and total_statistics counts them too.
 func (db *RawDB) GetTypeFeeStatsByDate(date time.Time) ([]TypeFeeStat, error) {
 	table := "transactions_" + date.Format("060102")
 	var stats []TypeFeeStat
 	err := db.db.Raw(fmt.Sprintf(`
 		SELECT type, COUNT(*) AS tx_count, COALESCE(SUM(fee), 0) AS fee
 		FROM %s
+		WHERE type <> %d
 		GROUP BY type
-		ORDER BY type`, table)).Scan(&stats).Error
+		ORDER BY type`, table, models.TransferType)).Scan(&stats).Error
 	return stats, err
 }
 
@@ -97,9 +107,12 @@ func (db *RawDB) GetAddrActivityByDate(date time.Time) (*AddrActivityStat, error
 	}
 
 	if stat.FromAddrCount > 0 {
+		// Lower median: OFFSET (n-1)/2 picks the smaller middle element on even
+		// n, keeping the value an integer an address actually has (an arithmetic
+		// mean of the two middles would be fractional and match no address).
 		if err := db.db.Raw(fmt.Sprintf(
 			`SELECT tx_total FROM %s WHERE address <> 'total' ORDER BY tx_total LIMIT 1 OFFSET %d`,
-			fromStats, stat.FromAddrCount/2)).
+			fromStats, (stat.FromAddrCount-1)/2)).
 			Scan(&stat.AddrTxMedian).Error; err != nil {
 			return nil, err
 		}
@@ -117,10 +130,12 @@ func (db *RawDB) GetAddrActivityByDate(date time.Time) (*AddrActivityStat, error
 		TrxTransferCount int64
 		TrxAmount        string
 	}
+	// result = 1: failed transfers move no TRX, so counting them would
+	// overstate both the transfer count and the amount.
 	if err := db.db.Raw(fmt.Sprintf(`
 		SELECT COUNT(*)                                                      AS trx_transfer_count,
 		       CAST(COALESCE(SUM(CAST(amount AS DECIMAL(38,0))), 0) AS CHAR) AS trx_amount
-		FROM %s WHERE type = 1`, txTable)).
+		FROM %s WHERE type = 1 AND result = 1`, txTable)).
 		Scan(&trx).Error; err != nil {
 		return nil, err
 	}
@@ -141,11 +156,18 @@ type CollectEnergyProvider struct {
 }
 
 // GetCollectEnergyProvidersByDate aggregates one day's ENERGY resource
-// delegations (type 157, provider in owner_addr) that target known exchange
-// charger addresses (fake chargers excluded), grouped by exchange and
-// provider. This answers "who supplies the energy behind each exchange's
-// collect sweeps": chargers hold no stake of their own, so collect energy
-// arrives almost entirely through these just-in-time delegations.
+// delegations (type 157, provider in owner_addr, successful only) that target
+// known exchange charger addresses (fake chargers excluded), grouped by
+// exchange and provider. This answers "who supplies the energy behind each
+// exchange's collect sweeps": chargers hold no stake of their own, so collect
+// energy arrives almost entirely through these just-in-time delegations.
+//
+// The join assumes chargers.address is unique — ChargerStore's in-memory map
+// is keyed by address and production currently holds zero duplicates
+// (COUNT(*) = COUNT(DISTINCT address)); a duplicate row would double-count
+// that address's delegations. Deduplicating in-query (derived GROUP BY over
+// the ~40M-row chargers table) measured out at >8 min per request, so the
+// invariant is better enforced with a unique index on chargers(address).
 func (db *RawDB) GetCollectEnergyProvidersByDate(date time.Time) ([]CollectEnergyProvider, error) {
 	table := "transactions_" + date.Format("060102")
 	var providers []CollectEnergyProvider
@@ -156,7 +178,7 @@ func (db *RawDB) GetCollectEnergyProvidersByDate(date time.Time) ([]CollectEnerg
 		       CAST(COALESCE(SUM(CAST(t.amount AS DECIMAL(38,0))), 0) AS CHAR) AS delegated_amount
 		FROM %s t
 		JOIN chargers c ON t.to_addr = c.address
-		WHERE t.type = 157 AND (c.is_fake = 0 OR c.is_fake IS NULL)
+		WHERE t.type = 157 AND t.result = 1 AND (c.is_fake = 0 OR c.is_fake IS NULL)
 		GROUP BY c.exchange_name, t.owner_addr
 		ORDER BY exchange, SUM(CAST(t.amount AS DECIMAL(38,0))) DESC`, table)).
 		Scan(&providers).Error
