@@ -12,6 +12,16 @@ import (
 // replace ad-hoc /q raw queries with the same semantics. Every method operates
 // on a single UTC day table and returns aggregate rows only — the per-day
 // transaction tables are never streamed into Go memory.
+//
+// Amount sums: amount is a decimal string in a uint256 domain — up to 78
+// digits (production holds real uint256-max rows, 77 digits), beyond
+// DECIMAL's 65-digit ceiling, where CAST saturates to all-nines and one row
+// poisons the whole sum. Every SUM therefore clamps via
+// IF(amount = '' OR amount = '<nil>' OR LENGTH(amount) > 65, '0', amount)
+// cast to DECIMAL(65,0): malformed or overflow-range amounts count as zero
+// toward the sum while the row still counts toward tx_count/fee. The same
+// guard (with a tighter uint64 bound) is the established pattern in the
+// top-delegate queries.
 
 // TokenAmountBucket is one LENGTH(amount) bucket of a token's transfers for one
 // day. digit_len N (N>=2) covers raw amounts in [10^(N-1), 10^N); digit_len 1
@@ -41,7 +51,7 @@ func (db *RawDB) GetTokenAmountBucketsByDate(date time.Time, tokenAddr string) (
 		       COUNT(*)                                                  AS tx_count,
 		       COALESCE(SUM(fee), 0)                                     AS fee,
 		       COALESCE(SUM(energy_usage + energy_origin_usage), 0)      AS stake_energy,
-		       CAST(COALESCE(SUM(CAST(amount AS DECIMAL(38,0))), 0) AS CHAR) AS amount
+		       CAST(COALESCE(SUM(CAST(IF(amount = '' OR amount = '<nil>' OR LENGTH(amount) > 65, '0', amount) AS DECIMAL(65,0))), 0) AS CHAR) AS amount
 		FROM %s
 		WHERE name = ? AND type IN (31, 131) AND from_addr <> '' AND result = 1
 		GROUP BY LENGTH(amount)
@@ -134,7 +144,7 @@ func (db *RawDB) GetAddrActivityByDate(date time.Time) (*AddrActivityStat, error
 	// overstate both the transfer count and the amount.
 	if err := db.db.Raw(fmt.Sprintf(`
 		SELECT COUNT(*)                                                      AS trx_transfer_count,
-		       CAST(COALESCE(SUM(CAST(amount AS DECIMAL(38,0))), 0) AS CHAR) AS trx_amount
+		       CAST(COALESCE(SUM(CAST(IF(amount = '' OR amount = '<nil>' OR LENGTH(amount) > 65, '0', amount) AS DECIMAL(65,0))), 0) AS CHAR) AS trx_amount
 		FROM %s WHERE type = 1 AND result = 1`, txTable)).
 		Scan(&trx).Error; err != nil {
 		return nil, err
@@ -175,12 +185,12 @@ func (db *RawDB) GetCollectEnergyProvidersByDate(date time.Time) ([]CollectEnerg
 		SELECT c.exchange_name                                               AS exchange,
 		       t.owner_addr                                                  AS provider,
 		       COUNT(*)                                                      AS tx_count,
-		       CAST(COALESCE(SUM(CAST(t.amount AS DECIMAL(38,0))), 0) AS CHAR) AS delegated_amount
+		       CAST(COALESCE(SUM(CAST(IF(t.amount = '' OR t.amount = '<nil>' OR LENGTH(t.amount) > 65, '0', t.amount) AS DECIMAL(65,0))), 0) AS CHAR) AS delegated_amount
 		FROM %s t
 		JOIN chargers c ON t.to_addr = c.address
 		WHERE t.type = 157 AND t.result = 1 AND (c.is_fake = 0 OR c.is_fake IS NULL)
 		GROUP BY c.exchange_name, t.owner_addr
-		ORDER BY exchange, SUM(CAST(t.amount AS DECIMAL(38,0))) DESC`, table)).
+		ORDER BY exchange, SUM(CAST(IF(t.amount = '' OR t.amount = '<nil>' OR LENGTH(t.amount) > 65, '0', t.amount) AS DECIMAL(65,0))) DESC`, table)).
 		Scan(&providers).Error
 	return providers, err
 }
